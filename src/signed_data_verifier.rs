@@ -1,12 +1,13 @@
-use base64::{DecodeError};
+use base64::DecodeError;
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use serde::de::DeserializeOwned;
-use crate::chain_verifier::{ChainVerifierError, verify_chain};
+use crate::chain_verifier::{verify_chain, ChainVerifierError};
 use crate::primitives::environment::Environment;
 use crate::primitives::jws_transaction_decoded_payload::JWSTransactionDecodedPayload;
 use crate::primitives::response_body_v2_decoded_payload::ResponseBodyV2DecodedPayload;
 use crate::utils::StringExt;
+use jwt_simple::algorithms::ECDSAP256PublicKeyLike;
+use serde::de::DeserializeOwned;
+use serde::ser::Serialize;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum SignedDataVerifierError {
@@ -25,8 +26,14 @@ pub enum SignedDataVerifierError {
     #[error("InternalDecodeError: [{0}]")]
     InternalDecodeError(#[from] base64::DecodeError),
 
-    #[error("InternalJWTError: [{0}]")]
-    InternalJWTError(#[from] jsonwebtoken::errors::Error)
+    #[error("InternalJWTError")]
+    InternalJWTError,
+}
+
+impl From<jwt_simple::Error> for SignedDataVerifierError {
+    fn from(value: jwt_simple::Error) -> Self {
+        Self::InternalJWTError
+    }
 }
 
 /// A verifier for signed data, commonly used for verifying and decoding
@@ -51,10 +58,11 @@ impl SignedDataVerifier {
     /// # Returns
     ///
     /// A new `SignedDataVerifier` instance.
-    pub fn new(root_certificates: Vec<Vec<u8>>,
-           environment: Environment,
-           bundle_id: String,
-           app_apple_id: Option<i64>,
+    pub fn new(
+        root_certificates: Vec<Vec<u8>>,
+        environment: Environment,
+        bundle_id: String,
+        app_apple_id: Option<i64>,
     ) -> Self {
         return SignedDataVerifier {
             root_certificates,
@@ -64,7 +72,6 @@ impl SignedDataVerifier {
         };
     }
 }
-
 
 impl SignedDataVerifier {
     /// Verifies and decodes a signed transaction.
@@ -81,15 +88,19 @@ impl SignedDataVerifier {
     ///
     /// - `Ok(JWSTransactionDecodedPayload)` if verification and decoding are successful.
     /// - `Err(SignedDataVerifierError)` if verification or decoding fails, with error details.
-    pub fn verify_and_decode_signed_transaction(&self, signed_transaction: &str) -> Result<JWSTransactionDecodedPayload, SignedDataVerifierError> {
-        let decoded_signed_tx: JWSTransactionDecodedPayload  = self.decode_signed_object(signed_transaction)?;
+    pub fn verify_and_decode_signed_transaction(
+        &self,
+        signed_transaction: &str,
+    ) -> Result<JWSTransactionDecodedPayload, SignedDataVerifierError> {
+        let decoded_signed_tx: JWSTransactionDecodedPayload =
+            self.decode_signed_object(signed_transaction)?;
 
         if decoded_signed_tx.bundle_id.as_ref() != Some(&self.bundle_id) {
-            return Err(SignedDataVerifierError::InvalidAppIdentifier)
+            return Err(SignedDataVerifierError::InvalidAppIdentifier);
         }
 
         if decoded_signed_tx.environment.as_ref() != Some(&self.environment) {
-            return Err(SignedDataVerifierError::InvalidEnvironment)
+            return Err(SignedDataVerifierError::InvalidEnvironment);
         }
 
         Ok(decoded_signed_tx)
@@ -109,8 +120,12 @@ impl SignedDataVerifier {
     ///
     /// - `Ok(ResponseBodyV2DecodedPayload)` if verification and decoding are successful.
     /// - `Err(SignedDataVerifierError)` if verification or decoding fails, with error details.
-    pub fn verify_and_decode_notification(&self, signed_payload: &str) -> Result<ResponseBodyV2DecodedPayload, SignedDataVerifierError> {
-        let decoded_signed_notification: ResponseBodyV2DecodedPayload  = self.decode_signed_object(signed_payload)?;
+    pub fn verify_and_decode_notification(
+        &self,
+        signed_payload: &str,
+    ) -> Result<ResponseBodyV2DecodedPayload, SignedDataVerifierError> {
+        let decoded_signed_notification: ResponseBodyV2DecodedPayload =
+            self.decode_signed_object(signed_payload)?;
 
         let bundle_id;
         let app_apple_id;
@@ -125,25 +140,31 @@ impl SignedDataVerifier {
             app_apple_id = summary.app_apple_id.clone();
             environment = summary.environment.clone();
         } else {
-            return Err(SignedDataVerifierError::InvalidAppIdentifier)
+            return Err(SignedDataVerifierError::InvalidAppIdentifier);
         }
 
-        if bundle_id.as_ref() != Some(&self.bundle_id) || (self.environment == Environment::Production && app_apple_id.as_ref() != self.app_apple_id.as_ref() ) {
-            return Err(SignedDataVerifierError::InvalidAppIdentifier)
+        if bundle_id.as_ref() != Some(&self.bundle_id)
+            || (self.environment == Environment::Production
+                && app_apple_id.as_ref() != self.app_apple_id.as_ref())
+        {
+            return Err(SignedDataVerifierError::InvalidAppIdentifier);
         }
 
         if environment.as_ref() != Some(&self.environment) {
-            return Err(SignedDataVerifierError::InvalidEnvironment)
+            return Err(SignedDataVerifierError::InvalidEnvironment);
         }
 
         Ok(decoded_signed_notification)
     }
 
     /// Private method used for decoding a signed object (internal use).
-    fn decode_signed_object<T: DeserializeOwned>(&self, signed_obj: &str) -> Result<T, SignedDataVerifierError> {
-        let header = jsonwebtoken::decode_header(signed_obj)?;
+    fn decode_signed_object<T: Serialize + DeserializeOwned>(
+        &self,
+        signed_obj: &str,
+    ) -> Result<T, SignedDataVerifierError> {
+        let header = jwt_simple::token::Token::decode_metadata(signed_obj)?;
 
-        let Some(x5c) = header.x5c else {
+        let Some(x5c) = header.certificate_chain() else {
             return Err(SignedDataVerifierError::VerificationFailure);
         };
 
@@ -154,29 +175,32 @@ impl SignedDataVerifier {
         let x5c: Result<Vec<Vec<u8>>, DecodeError> = x5c.iter().map(|c| c.as_der_bytes()).collect();
         let chain = x5c?;
 
-        if header.alg != Algorithm::ES256 {
+        if header.algorithm() != "ES256" {
             return Err(SignedDataVerifierError::VerificationFailure);
         }
 
         let pub_key = verify_chain(&chain, &self.root_certificates, None)?;
-        let pub_key = &pub_key[pub_key.len() - 65..];
 
-        let decoding_key = DecodingKey::from_ec_der(pub_key);
         let claims: [&str; 0] = [];
 
-        let mut validator = Validation::new(Algorithm::ES256);
-        validator.validate_exp = false;
-        validator.set_required_spec_claims(&claims);
-
-        let payload = jsonwebtoken::decode::<T>(signed_obj, &decoding_key, &validator).expect("Expect Payload");
-        return Ok(payload.claims);
+        let key = jwt_simple::algorithms::ES256PublicKey::from_der(&pub_key)?;
+        return Ok(key
+            .verify_token(
+                signed_obj,
+                Some(jwt_simple::common::VerificationOptions {
+                    accept_future: true,
+                    time_tolerance: Some(std::time::Duration::MAX.into()),
+                    ..Default::default()
+                }),
+            )?
+            .custom);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::primitives::notification_type_v2::NotificationTypeV2;
     use super::*;
+    use crate::primitives::notification_type_v2::NotificationTypeV2;
 
     const ROOT_CA_BASE64_ENCODED: &str = "MIIBgjCCASmgAwIBAgIJALUc5ALiH5pbMAoGCCqGSM49BAMDMDYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIDApDYWxpZm9ybmlhMRIwEAYDVQQHDAlDdXBlcnRpbm8wHhcNMjMwMTA1MjEzMDIyWhcNMzMwMTAyMjEzMDIyWjA2MQswCQYDVQQGEwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTESMBAGA1UEBwwJQ3VwZXJ0aW5vMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc+/Bl+gospo6tf9Z7io5tdKdrlN1YdVnqEhEDXDShzdAJPQijamXIMHf8xWWTa1zgoYTxOKpbuJtDplz1XriTaMgMB4wDAYDVR0TBAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwMDRwAwRAIgemWQXnMAdTad2JDJWng9U4uBBL5mA7WI05H7oH7c6iQCIHiRqMjNfzUAyiu9h6rOU/K+iTR0I/3Y/NSWsXHX+acc";
 
@@ -189,7 +213,9 @@ mod tests {
     #[test]
     fn test_app_store_server_notification_decoding() {
         let verifier = get_payload_verifier();
-        let notification = verifier.verify_and_decode_notification(TEST_NOTIFICATION).unwrap();
+        let notification = verifier
+            .verify_and_decode_notification(TEST_NOTIFICATION)
+            .unwrap();
         assert_eq!(notification.notification_type, NotificationTypeV2::Test);
     }
 
@@ -197,14 +223,20 @@ mod tests {
     fn test_missing_x5c_header() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification(MISSING_X5C_HEADER_CLAIM);
-        assert_eq!(result.err().unwrap(), SignedDataVerifierError::VerificationFailure);
+        assert_eq!(
+            result.err().unwrap(),
+            SignedDataVerifierError::VerificationFailure
+        );
     }
 
     #[test]
     fn test_wrong_bundle_id_for_server_notification() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification(WRONG_BUNDLE_ID);
-        assert_eq!(result.err().unwrap(), SignedDataVerifierError::InvalidAppIdentifier);
+        assert_eq!(
+            result.err().unwrap(),
+            SignedDataVerifierError::InvalidAppIdentifier
+        );
     }
 
     #[test]
@@ -216,7 +248,10 @@ mod tests {
             Some(1235),
         );
         let result = verifier.verify_and_decode_notification(TEST_NOTIFICATION);
-        assert_eq!(result.err().unwrap(), SignedDataVerifierError::InvalidAppIdentifier);
+        assert_eq!(
+            result.err().unwrap(),
+            SignedDataVerifierError::InvalidAppIdentifier
+        );
     }
 
     // #[test]
@@ -229,7 +264,9 @@ mod tests {
     #[test]
     fn test_transaction_info_decoding() {
         let verifier = get_payload_verifier();
-        let notification = verifier.verify_and_decode_signed_transaction(TRANSACTION_INFO).unwrap();
+        let notification = verifier
+            .verify_and_decode_signed_transaction(TRANSACTION_INFO)
+            .unwrap();
         assert_eq!(notification.environment, Some(Environment::Sandbox));
     }
 
@@ -237,14 +274,22 @@ mod tests {
     fn test_malformed_jwt_with_too_many_parts() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification("a.b.c.d");
-        assert!(result.err().unwrap().to_string().contains("InternalJWTError"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("InternalJWTError"));
     }
 
     #[test]
     fn test_malformed_jwt_with_malformed_data() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification("a.b.c");
-        assert!(result.err().unwrap().to_string().contains("InternalJWTError"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("InternalJWTError"));
     }
 
     fn get_payload_verifier() -> SignedDataVerifier {
@@ -252,9 +297,9 @@ mod tests {
             vec![ROOT_CA_BASE64_ENCODED.as_der_bytes().unwrap()],
             Environment::Sandbox,
             "com.example".to_string(),
-            None);
+            None,
+        );
 
         verifier
     }
 }
-
