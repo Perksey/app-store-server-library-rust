@@ -9,7 +9,7 @@ use jwt_simple::algorithms::ECDSAP256PublicKeyLike;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
-#[derive(thiserror::Error, Debug, PartialEq)]
+#[derive(thiserror::Error, Debug)]
 pub enum SignedDataVerifierError {
     #[error("VerificationFailure")]
     VerificationFailure,
@@ -223,20 +223,20 @@ mod tests {
     fn test_missing_x5c_header() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification(MISSING_X5C_HEADER_CLAIM);
-        assert_eq!(
+        assert!(matches!(
             result.err().unwrap(),
             SignedDataVerifierError::VerificationFailure
-        );
+        ));
     }
 
     #[test]
     fn test_wrong_bundle_id_for_server_notification() {
         let verifier = get_payload_verifier();
         let result = verifier.verify_and_decode_notification(WRONG_BUNDLE_ID);
-        assert_eq!(
+        assert!(matches!(
             result.err().unwrap(),
             SignedDataVerifierError::InvalidAppIdentifier
-        );
+        ));
     }
 
     #[test]
@@ -248,10 +248,11 @@ mod tests {
             Some(1235),
         );
         let result = verifier.verify_and_decode_notification(TEST_NOTIFICATION);
-        assert_eq!(
+        println!("{:?}", result);
+        assert!(matches!(
             result.err().unwrap(),
             SignedDataVerifierError::InvalidAppIdentifier
-        );
+        ));
     }
 
     // #[test]
